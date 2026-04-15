@@ -611,44 +611,17 @@ class PlayerAgent:
         if self.tracker is not None:
             search_loc, search_prob = self.tracker.best_guess()
 
-        # === EXTEND-THEN-ROLL STRATEGY ===
-        # Data from 50 bytefight games vs Carrie: 77% of MyBot length-2 rolls
-        # had a free neighbor to extend into, and 63% happened with >=5 turns
-        # remaining. Meanwhile Carrie has 2.2x more length-4+ rolls than us,
-        # and the carpet-point gap (12.2 vs 18.1 /game) is the primary
-        # source of the -2.9 mean score diff. Roll length-3+ immediately
-        # (big enough), but extend length-2 chains when safe and feasible.
+        # === CARRIE-MATCHING STRATEGY: fast prime→roll cycles ===
+        # Carrie averages 7.2 rolls/game at length 2.3. She accepts length-2
+        # rolls to keep the cycle fast. 44% of her rolls are length-2.
+        # Her split: 42% prime, 28% plain, 18% carpet, 13% search.
 
-        # 1) Length 3+: roll immediately, the payoff is locked in.
-        if best_roll_len >= 3:
-            return Move.carpet(best_roll_dir, best_roll_len)
-
-        # 2) Length-2 chain: check if we can extend it safely first.
+        # 1) Always roll length-2+ immediately. Don't hold out for longer.
+        #    Banked points > speculative longer chain.
         if best_roll_len >= 2:
-            # We can extend if the best_prime_dir is the opposite of
-            # best_roll_dir (priming behind us grows the roll chain).
-            can_extend_same_chain = (
-                best_prime_dir is not None
-                and best_prime_dir == OPPOSITE_DIR[best_roll_dir]
-                and best_max_chain > best_roll_len
-                and turns_left >= 3
-            )
-            # Safety: opponent must not be adjacent to any chain cell
-            # (or they'll steal it on their next turn).
-            if can_extend_same_chain:
-                cur = my_loc
-                min_opp_dist = 10
-                for _ in range(best_roll_len):
-                    cur = loc_after_direction(cur, best_roll_dir)
-                    d = abs(cur[0] - enemy_loc[0]) + abs(cur[1] - enemy_loc[1])
-                    if d < min_opp_dist:
-                        min_opp_dist = d
-                if min_opp_dist >= 3:
-                    return Move.prime(best_prime_dir)
-            # Otherwise, roll the length-2 now.
             return Move.carpet(best_roll_dir, best_roll_len)
 
-        # 3) Last turn: prime for +1 or search
+        # 2) Last turn: prime for +1 or search
         if turns_left <= 1:
             if best_prime_dir is not None:
                 return Move.prime(best_prime_dir)
@@ -656,7 +629,7 @@ class PlayerAgent:
                 return Move.search(search_loc)
             return self._fallback(board, my_loc, enemy_loc, search_loc, search_prob)
 
-        # 4) Extend chain — prime if any direction available
+        # 3) Extend chain — prime if any direction available
         if best_prime_dir is not None:
             return Move.prime(best_prime_dir)
 
@@ -941,26 +914,6 @@ class PlayerAgent:
                 mc = BOARD_SIZE - 1
             pv = CARPET_POINTS_TABLE[mc] if mc >= 2 else 0
             score = 50 + pv * 3 + existing * 3
-            # EXTENSION BONUS: if this prime extends an existing rollable chain
-            # (existing >= 2), score it competitively with the corresponding
-            # carpet roll so minimax actually considers extending. Data from
-            # 50 bytefight games shows 77% of length-2 rolls had an extension
-            # available but minimax still picked roll-now due to eval bias.
-            # Only apply when opponent is far enough to not steal.
-            if existing >= 2 and mc > existing:
-                # Min opponent distance to the existing chain cells
-                ox, oy = enemy_loc
-                opp_d = OPPOSITE_DIR[d]
-                min_opp = 10
-                cell = my_loc
-                for _ in range(existing):
-                    cell = loc_after_direction(cell, opp_d)
-                    dd = abs(cell[0]-ox) + abs(cell[1]-oy)
-                    if dd < min_opp:
-                        min_opp = dd
-                if min_opp >= 3:
-                    # Safe to extend; score near the projected roll value.
-                    score = 200 + CARPET_POINTS_TABLE[mc] * 5 - 15
             # Build-away bonus
             target = loc_after_direction(my_loc, d)
             tx, ty = target
@@ -1212,13 +1165,14 @@ class PlayerAgent:
                 best_L = min(max_possible, existing + effective_turns - 1, BOARD_SIZE - 1)
                 if best_L >= 2:
                     new_primes = max(0, best_L - existing)
-                    # Credit the full carpet payoff, less a 1-pt cost per prime
-                    # still needed (each costs one turn where opp could interfere).
-                    # Ready-to-roll chains (new_primes=0) get FULL credit so the
-                    # eval doesn't falsely prefer rolling over extending.
-                    pts = CARPET_POINTS_TABLE[best_L] - new_primes
-                    if pts < 0:
+                    # KEY FIX: if the chain is already rollable (new_primes == 0),
+                    # don't credit the carpet payoff here — it belongs in my_pts
+                    # once actually rolled. Crediting it as "potential" makes the
+                    # search think extending is free and never rolls.
+                    if new_primes == 0:
                         pts = 0
+                    else:
+                        pts = new_primes + CARPET_POINTS_TABLE[best_L]
                 else:
                     pts = 1 if effective_turns >= 1 and additional >= 1 else 0
             else:
