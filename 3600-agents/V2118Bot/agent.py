@@ -177,40 +177,6 @@ class HMMRatTracker:
         order = np.argsort(-self.belief)[:k]
         return [(idx_to_pos(int(i)), float(self.belief[i])) for i in order]
 
-    def top2_ratio(self) -> float:
-        """Ratio of top-1 to top-2 belief. High = confident, low = ambiguous.
-
-        Distance-ring ambiguity: when the worker is stationary, all cells on
-        the same Manhattan ring look identical to update_distance. If top-2
-        ratio is near 1.0, the HMM is split between two (or more) cells on
-        the same ring and searching the top is a coinflip — exactly the bug
-        that caused our 33% hit rate in bytefight losses.
-        """
-        order = np.argsort(-self.belief)
-        p1 = float(self.belief[order[0]])
-        p2 = float(self.belief[order[1]])
-        if p2 <= 1e-10:
-            return 1e10
-        return p1 / p2
-
-    def ring_peers(self, worker_loc: Tuple[int, int], top_cell: Tuple[int, int],
-                   threshold: float = 0.5) -> int:
-        """Count cells on the SAME Manhattan-distance ring as top_cell that
-        hold at least `threshold * p(top)` belief. If >1, the HMM is split
-        across the ring — do NOT search until the worker moves.
-        """
-        w_idx = worker_loc[1] * BOARD_SIZE + worker_loc[0]
-        ring_dist = self._dist_table[w_idx][top_cell[1] * BOARD_SIZE + top_cell[0]]
-        top_p = float(self.belief[top_cell[1] * BOARD_SIZE + top_cell[0]])
-        if top_p <= 1e-10:
-            return 0
-        cutoff = top_p * threshold
-        peers = 0
-        for i in range(64):
-            if self._dist_table[w_idx][i] == ring_dist and self.belief[i] >= cutoff:
-                peers += 1
-        return peers
-
 
 # ── Player Agent ───────────────────────────────────────────────────────────────
 
@@ -243,13 +209,6 @@ class PlayerAgent:
         self.catches = 0
         self.search_beliefs: list = []   # belief at moment we decided to search
         self.max_belief_per_turn: list = []  # max belief each turn (for debugging)
-
-        # ── ring-ambiguity defense ──
-        # Track how many turns the worker has sat in one spot without moving.
-        # When this is high AND the top belief cell has ring-peers, the HMM is
-        # locked on ambiguous evidence and searching is a coinflip.
-        self._last_worker_loc: Optional[Tuple[int, int]] = None
-        self._stationary_turns = 0
 
         # ── minimax diagnostics ──
         self.max_depth_reached = 0
@@ -311,14 +270,6 @@ class PlayerAgent:
         self.is_first_turn = False
         self.turn_number += 1
 
-        # Track stationary turns: the ring-ambiguity gate uses this.
-        cur_loc = board.player_worker.get_location()
-        if self._last_worker_loc is not None and cur_loc == self._last_worker_loc:
-            self._stationary_turns += 1
-        else:
-            self._stationary_turns = 0
-        self._last_worker_loc = cur_loc
-
         # Record max belief this turn (for diagnostics)
         if self.tracker is not None:
             _, mb = self.tracker.best_guess()
@@ -326,17 +277,11 @@ class PlayerAgent:
 
         move = self._choose_move_top(board, time_left)
 
-        # BULLETPROOF CAP: reject any search move if quota reached.
-        # This catches ALL bypass paths (line 585 fallback escape hatch,
-        # minimax edge cases, etc). Replaces with a best non-search move.
-        if (move is not None and move.move_type == MoveType.SEARCH
-                and self._search_hard_cap_reached()):
-            replacement = self._pick_nonsearch_move(board)
-            if replacement is not None:
-                move = replacement
-
         # Record search diagnostics + update consecutive-search flag
         if move is not None and move.move_type == MoveType.SEARCH:
+            tag = getattr(self, '_search_path_tag', '?')
+            print(f"[SEARCH-RET] turn={self.turn_number} count_before={self.search_count} tag={tag}",
+                  file=sys.stderr)
             self.search_count += 1
             self._searched_last_turn = True
             if self.tracker is not None:
@@ -344,49 +289,9 @@ class PlayerAgent:
                 self.search_beliefs.append(p)
         else:
             self._searched_last_turn = False
+        self._search_path_tag = None
 
         return move
-
-    def _search_hard_cap_reached(self) -> bool:
-        """The ultimate backstop. Any search attempted when this returns
-        True is replaced with a non-search move in play()."""
-        sc = self.search_count
-        cc = self.catches
-        if sc >= 8:
-            return True
-        # Zero-catch shutoff after 3 tries: HMM is clearly broken
-        if sc >= 3 and cc == 0:
-            return True
-        # Below-30% hit rate after 4 tries
-        if sc >= 4 and cc < sc * 0.3:
-            return True
-        return False
-
-    def _pick_nonsearch_move(self, board: Board):
-        """Best non-search replacement. Never returns length-1 carpet."""
-        try:
-            all_moves = board.get_valid_moves(exclude_search=True)
-            # Sort: long carpets first, then primes, then plains
-            carpets = sorted([m for m in all_moves
-                              if m.move_type == MoveType.CARPET
-                              and m.roll_length >= 2],
-                             key=lambda m: -m.roll_length)
-            primes = [m for m in all_moves if m.move_type == MoveType.PRIME]
-            plains = [m for m in all_moves if m.move_type == MoveType.PLAIN]
-            if carpets:
-                return carpets[0]
-            if primes:
-                return primes[0]
-            if plains:
-                return plains[0]
-            # Only length-1 carpets remain — take one (-1 pt > -2 search)
-            len1s = [m for m in all_moves
-                     if m.move_type == MoveType.CARPET and m.roll_length == 1]
-            if len1s:
-                return len1s[0]
-        except Exception:
-            pass
-        return None
 
     # ─────────────────────── top-level decision ───────────────────────
 
@@ -434,22 +339,16 @@ class PlayerAgent:
         if self.is_first_turn:
             # First rat move (always happens before any sample)
             self.tracker.predict()
-            # If I'm Player B, A has already played, the rat has moved AGAIN,
-            # and A may have searched in between. Apply A's search if any,
-            # then a SECOND unconditional predict for B's pre-sample rat move.
-            # Detect Player-B by checking is_player_a_turn (flipped to True
-            # after A's apply_move) — we are B if is_player_a_turn is True
-            # on what the board thinks is "the player's turn."
-            am_player_b = not board.is_player_a_turn
+            # If I'm Player B, A has already played and may have searched.
+            # board.opponent_search will be populated with A's last search.
+            # We need to apply that observation, then a second predict for
+            # the rat move that happens between A's turn and B's sample.
             opp_loc, opp_caught = board.opponent_search
             if opp_loc is not None:
                 if opp_caught:
                     self.tracker.apply_search_hit()
                 else:
                     self.tracker.apply_search_miss(opp_loc)
-            if am_player_b:
-                # Second predict regardless of whether A searched — the rat
-                # moved between A's sample and B's sample either way.
                 self.tracker.predict()
         else:
             # 1) My own search result from previous turn (belief still at T).
@@ -626,6 +525,7 @@ class PlayerAgent:
             if best_prime_dir is not None:
                 return Move.prime(best_prime_dir)
             if search_loc and self._should_search(search_prob):
+                self._search_path_tag = 'greedy_lastturn'
                 return Move.search(search_loc)
             return self._fallback(board, my_loc, enemy_loc, search_loc, search_prob)
 
@@ -635,6 +535,7 @@ class PlayerAgent:
 
         # 4) Search (only when nothing productive available)
         if search_loc and self._should_search(search_prob):
+            self._search_path_tag = 'greedy_main'
             return Move.search(search_loc)
 
         # 5) Reposition
@@ -647,26 +548,16 @@ class PlayerAgent:
         Hard caps to prevent the catastrophic 17-21 search/game pattern
         seen on bytefight when the HMM tracker is miscalibrated.
         """
-        if self._search_hard_cap_reached():
+        # HARD CAP: never search more than 8 times per game, period.
+        if self.search_count >= 8:
+            return False
+        # HIT RATE SHUTOFF: if we've searched 4+ times and hit rate is
+        # below 30%, the HMM is clearly wrong — stop searching entirely.
+        if self.search_count >= 4 and self.catches < self.search_count * 0.3:
             return False
         # Consecutive search block (unless very confident)
         if self._searched_last_turn and search_prob < SEARCH_CONSECUTIVE_OVERRIDE:
             return False
-        # RING-AMBIGUITY GATE: if the HMM has multiple high-belief cells on
-        # the same Manhattan ring from the worker, the top-1 is a coinflip.
-        # The HMM agent's empirical test showed this is the real cause of
-        # the bimodal 73% / 33% hit rate. Require movement before searching
-        # through ambiguous ring evidence.
-        if self.tracker is not None and self._last_worker_loc is not None:
-            top_cell, _ = self.tracker.best_guess()
-            peers = self.tracker.ring_peers(self._last_worker_loc, top_cell, 0.4)
-            if peers >= 2:
-                # Multiple cells at ~40% of top on same ring — AMBIGUOUS
-                return False
-            # Also require a recent vantage change: if worker has been stuck
-            # more than 3 turns, require very high belief to overcome it.
-            if self._stationary_turns >= 3 and search_prob < 0.75:
-                return False
         floor = SEARCH_HIGH_FLOOR if self.search_count >= SEARCH_BUDGET \
                 else SEARCH_ALWAYS_THRESHOLD
         return search_prob >= floor
@@ -687,20 +578,24 @@ class PlayerAgent:
 
     def _fallback(self, board, my_loc, enemy_loc, search_loc, search_prob):
         if search_loc and self._should_search(search_prob):
+            self._search_path_tag = 'fallback_should'
             return Move.search(search_loc)
         moves = board.get_valid_moves(exclude_search=True)
-        # Never play length-1 carpet from fallback (-1 pt) unless it's the
-        # ONLY non-search option.
-        non_len1 = [m for m in moves
-                    if not (m.move_type == MoveType.CARPET and m.roll_length == 1)]
-        if non_len1:
-            return non_len1[0]
-        # All non-search moves are length-1 carpets: take one — beats search.
+        # Never play length-1 carpet from fallback (-1 pt)
+        moves = [m for m in moves
+                 if not (m.move_type == MoveType.CARPET and m.roll_length == 1)]
         if moves:
             return moves[0]
-        # Truly no valid non-search moves. This is the (0,0) escape hatch,
-        # which used to bypass the search cap. The play-level bulletproof
-        # cap will replace this if needed.
+        moves = board.get_valid_moves(exclude_search=False)
+        moves = [m for m in moves
+                 if not (m.move_type == MoveType.CARPET and m.roll_length == 1)]
+        if moves:
+            # Check if first move is a search — log if so
+            m0 = moves[0]
+            if m0.move_type == MoveType.SEARCH:
+                self._search_path_tag = 'fallback_list_search'
+            return m0
+        self._search_path_tag = 'fallback_zero_escape'
         return Move.search((0, 0))
 
     # ─────────────────────── minimax ───────────────────────
@@ -740,21 +635,21 @@ class PlayerAgent:
         search_ev = 0.0
         can_search = (self.tracker is not None
                       and not self._searched_last_turn
-                      and not self._search_hard_cap_reached())
+                      and self.search_count < 8  # hard cap
+                      and not (self.search_count >= 4 and self.catches < self.search_count * 0.3))
+        print(f"[MM-GATE] turn={self.turn_number} sc={self.search_count} cc={self.catches} "
+              f"srch_last={self._searched_last_turn} can_search={can_search}", file=sys.stderr)
+        search_move_injected = None
         if can_search:
             s_loc, s_prob = self.tracker.best_guess()
-            # RING-AMBIGUITY GATE: don't inject search if belief is split
-            # across multiple cells on the same Manhattan ring from worker.
-            peers = self.tracker.ring_peers(my_loc, s_loc, 0.4)
-            ring_ok = peers < 2
-            # Also require a vantage change if stuck
-            vantage_ok = (self._stationary_turns < 3 or s_prob >= 0.75)
             # Diminishing returns: tighten threshold after budget exhausted.
             floor = SEARCH_HIGH_FLOOR if self.search_count >= SEARCH_BUDGET \
                     else SEARCH_MINIMAX_FLOOR
-            if s_prob >= floor and ring_ok and vantage_ok:
+            print(f"[MM-GATE] s_prob={s_prob:.3f} floor={floor:.3f}", file=sys.stderr)
+            if s_prob >= floor:
                 search_ev = 6.0 * s_prob - 2.0
                 search_move = Move.search(s_loc)
+                search_move_injected = search_move
                 # Score it high enough to be tried early when EV is good
                 scored.append((40 + search_ev * 10, search_move))
 
@@ -816,6 +711,14 @@ class PlayerAgent:
                     moves.remove(best_move)
                     moves.insert(0, best_move)
 
+        if best_move is not None and best_move.move_type == MoveType.SEARCH:
+            # Tag where this search came from
+            if search_move_injected is not None and best_move == search_move_injected:
+                self._search_path_tag = 'minimax_injected'
+            else:
+                self._search_path_tag = 'minimax_UNKNOWN_SEARCH'
+                print(f"[MM-UNKNOWN-SEARCH] turn={self.turn_number} sc={self.search_count} "
+                      f"can_search={can_search} injected={search_move_injected}", file=sys.stderr)
         return best_move, best_val
 
     def _negamax(self, board: Board, depth, alpha, beta, time_left, deadline):
