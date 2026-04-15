@@ -49,13 +49,16 @@ def _shift_right(m): return (m << 1) & 0xFEFEFEFEFEFEFEFE
 # Indexed by Direction int value (UP=0, RIGHT=1, DOWN=2, LEFT=3)
 SHIFTS = (_shift_up, _shift_right, _shift_down, _shift_left)
 
-# Search EV breakeven is P > 1/3 ≈ 0.333, but the real breakeven after the
-# 2-3 pt opportunity cost of a wasted carpet-build turn sits closer to 0.45.
-# Albert's empirical hit rate at his floor is ~83%, ours at 0.35 was 50%.
-SEARCH_MINIMAX_FLOOR = 0.45     # batch 5 values — higher volume + HMM accuracy
-SEARCH_HIGH_FLOOR = 0.55       # tighter gate after budget exhausted
-SEARCH_BUDGET = 6              # don't trigger tight gate too early
-SEARCH_ALWAYS_THRESHOLD = 0.45 # greedy path matches minimax floor
+# Search EV breakeven from rules: P > 1/3 ≈ 0.333 (each hit +4, each miss -2).
+# From 50 bytefight games: MyBot's hit rate at floor 0.45 was 58.6% — higher
+# than Carrie's 52.4% — meaning we leave accurate searches on the table.
+# Lowering the floor to 0.40 should let through ~1 extra search/game at
+# ~58% hit rate, yielding roughly +1-1.5 pts/game. Ring-ambiguity gate and
+# the hit-rate shutoff still protect against disaster games.
+SEARCH_MINIMAX_FLOOR = 0.40     # lowered from 0.45 to capture more +EV searches
+SEARCH_HIGH_FLOOR = 0.55        # tighter gate after budget exhausted
+SEARCH_BUDGET = 6               # don't trigger tight gate too early
+SEARCH_ALWAYS_THRESHOLD = 0.40  # greedy path matches minimax floor
 SEARCH_CONSECUTIVE_OVERRIDE = 0.80  # allow back-to-back if very confident
 
 
