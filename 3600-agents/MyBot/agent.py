@@ -624,7 +624,24 @@ class PlayerAgent:
         if best_roll_len >= 2:
             return Move.carpet(best_roll_dir, best_roll_len)
 
-        # 2) Last turn: prime for +1 or search
+        # 2) Cold-roll: walk to a nearby rollable chain. Carrie rolls 7.5/game
+        #    vs our 4.6 because she walks to existing primed cells and rolls
+        #    them ("cold-rolling") instead of always building new chains.
+        #    If no immediate roll exists but a 1-step walk reaches one, walk.
+        if turns_left >= 2:
+            best_cold_dir, best_cold_len = None, 0
+            for d in ALL_DIRS:
+                if not board.is_valid_move(Move.plain(d)):
+                    continue
+                target = loc_after_direction(my_loc, d)
+                cold_len = self._best_steal_from(board, target, my_loc)
+                if cold_len > best_cold_len:
+                    best_cold_len = cold_len
+                    best_cold_dir = d
+            if best_cold_len >= 2:
+                return Move.plain(best_cold_dir)
+
+        # 3) Last turn: prime for +1 or search
         if turns_left <= 1:
             if best_prime_dir is not None:
                 return Move.prime(best_prime_dir)
@@ -632,15 +649,15 @@ class PlayerAgent:
                 return Move.search(search_loc)
             return self._fallback(board, my_loc, enemy_loc, search_loc, search_prob, turns_left)
 
-        # 3) Extend chain — prime if any direction available
+        # 4) Extend chain — prime if any direction available
         if best_prime_dir is not None:
             return Move.prime(best_prime_dir)
 
-        # 4) Search (only when nothing productive available)
+        # 5) Search (only when nothing productive available)
         if search_loc and self._should_search(search_prob, turns_left):
             return Move.search(search_loc)
 
-        # 5) Reposition
+        # 6) Reposition
         p = self._best_plain_move(board, my_loc, enemy_loc)
         return p if p else self._fallback(board, my_loc, enemy_loc, search_loc, search_prob, turns_left)
 
@@ -697,18 +714,21 @@ class PlayerAgent:
         if search_loc and self._should_search(search_prob, turns_left):
             return Move.search(search_loc)
         moves = board.get_valid_moves(exclude_search=True)
-        # Never play length-1 carpet from fallback (-1 pt) unless it's the
-        # ONLY non-search option.
+        # Never play length-1 carpet from fallback — it's always -1 pt.
         non_len1 = [m for m in moves
                     if not (m.move_type == MoveType.CARPET and m.roll_length == 1)]
         if non_len1:
             return non_len1[0]
-        # All non-search moves are length-1 carpets: take one — beats search.
+        # Only length-1 carpets remain. Search at EV-breakeven (0.33) is
+        # strictly better than length-1 carpet (-1 pt guaranteed). Try a
+        # search before accepting the -1.
+        if search_loc and not self._search_hard_cap_reached():
+            _, sp = self.tracker.best_guess() if self.tracker else (None, 0)
+            if sp >= 0.33:
+                return Move.search(search_loc)
+        # True last resort: length-1 carpet (-1 pt > -2 search miss).
         if moves:
             return moves[0]
-        # Truly no valid non-search moves. This is the (0,0) escape hatch,
-        # which used to bypass the search cap. The play-level bulletproof
-        # cap will replace this if needed.
         return Move.search((0, 0))
 
     # ─────────────────────── minimax ───────────────────────
