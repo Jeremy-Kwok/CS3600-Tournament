@@ -936,14 +936,33 @@ class PlayerAgent:
                 return -50
             if board._carpet_mask & bit:
                 return -15  # carpet traversal
-            # Check if this PLAIN move reaches a position to steal opponent chains.
-            # From the target cell, count rollable primed chains (any primed cells
-            # are stealable, regardless of who primed them).
+            # Check if this PLAIN move reaches a position to steal chains.
+            # A steal is +N carpet pts for us AND denies the opponent those
+            # pts — the swing is roughly 2× the carpet value. Score steals
+            # competitively with own-chain carpet rolls so minimax considers
+            # walking to steal instead of rolling a short own-chain.
             steal_len = self._best_steal_from(board, target, my_loc)
             if steal_len >= 3:
-                # Stealing a length-3+ chain is worth as much as building our own
-                return 150 + CARPET_POINTS_TABLE[steal_len] * 3
+                return 220 + CARPET_POINTS_TABLE[steal_len] * 5
             if steal_len >= 2:
+                return 190
+            # D-2 approach: one plain-move away from a steal. Scan neighbors
+            # of target for adjacent primed chains reachable next turn.
+            best_approach = 0
+            primed = board._primed_mask
+            for ad in ALL_DIRS:
+                n = loc_after_direction(target, ad)
+                nx, ny = n
+                if not (0 <= nx < BOARD_SIZE and 0 <= ny < BOARD_SIZE):
+                    continue
+                if not (primed & (1 << (ny * BOARD_SIZE + nx))):
+                    continue
+                a_len = self._best_steal_from(board, n, target)
+                if a_len > best_approach:
+                    best_approach = a_len
+            if best_approach >= 3:
+                return 100 + best_approach * 10
+            if best_approach >= 2:
                 return 80
             # If we have an in-progress chain, don't wander
             if best_chain >= 2:
