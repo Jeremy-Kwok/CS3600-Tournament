@@ -628,23 +628,23 @@ class PlayerAgent:
         if turns_left <= 1:
             if best_prime_dir is not None:
                 return Move.prime(best_prime_dir)
-            if search_loc and self._should_search(search_prob):
+            if search_loc and self._should_search(search_prob, turns_left):
                 return Move.search(search_loc)
-            return self._fallback(board, my_loc, enemy_loc, search_loc, search_prob)
+            return self._fallback(board, my_loc, enemy_loc, search_loc, search_prob, turns_left)
 
         # 3) Extend chain — prime if any direction available
         if best_prime_dir is not None:
             return Move.prime(best_prime_dir)
 
         # 4) Search (only when nothing productive available)
-        if search_loc and self._should_search(search_prob):
+        if search_loc and self._should_search(search_prob, turns_left):
             return Move.search(search_loc)
 
         # 5) Reposition
         p = self._best_plain_move(board, my_loc, enemy_loc)
-        return p if p else self._fallback(board, my_loc, enemy_loc, search_loc, search_prob)
+        return p if p else self._fallback(board, my_loc, enemy_loc, search_loc, search_prob, turns_left)
 
-    def _should_search(self, search_prob: float) -> bool:
+    def _should_search(self, search_prob: float, turns_left: int = 40) -> bool:
         """Centralised search-discipline gate. Used by greedy + fallback paths.
 
         Hard caps to prevent the catastrophic 17-21 search/game pattern
@@ -670,6 +670,11 @@ class PlayerAgent:
             # more than 3 turns, require very high belief to overcome it.
             if self._stationary_turns >= 3 and search_prob < 0.75:
                 return False
+        # Endgame: in the last 5 turns, opportunity cost of searching drops
+        # to near zero (no time for prime-roll cycles). Use the pure EV
+        # breakeven of 0.33 instead of the normal floor.
+        if turns_left <= 5:
+            return search_prob >= 0.33
         floor = SEARCH_HIGH_FLOOR if self.search_count >= SEARCH_BUDGET \
                 else SEARCH_ALWAYS_THRESHOLD
         return search_prob >= floor
@@ -688,8 +693,8 @@ class PlayerAgent:
                 best_score, best_dir = score, d
         return Move.plain(best_dir) if best_dir is not None else None
 
-    def _fallback(self, board, my_loc, enemy_loc, search_loc, search_prob):
-        if search_loc and self._should_search(search_prob):
+    def _fallback(self, board, my_loc, enemy_loc, search_loc, search_prob, turns_left=40):
+        if search_loc and self._should_search(search_prob, turns_left):
             return Move.search(search_loc)
         moves = board.get_valid_moves(exclude_search=True)
         # Never play length-1 carpet from fallback (-1 pt) unless it's the
@@ -717,8 +722,12 @@ class PlayerAgent:
         except Exception:
             pass
         turns_remaining = max(1, board.player_worker.turns_left)
-        # Use ~80% of fair-share per turn, capped at 4.0s.
-        budget = min(4.0, max(0.5, remaining / turns_remaining * 0.8))
+        # Use ~80% of fair-share per turn. Old cap of 4.0s wasted 99s/game
+        # (59% utilization). Raising to 10.0s lets natural allocation work
+        # (4.8s early, 6.4s mid, 10s late) while keeping a safety margin.
+        budget = min(10.0, max(0.5, remaining / turns_remaining * 0.8))
+        if remaining < 15.0:
+            budget = min(1.0, budget)  # safety: don't timeout in endgame
         deadline = remaining - budget
 
         my_loc = board.player_worker.get_location()
@@ -762,7 +771,7 @@ class PlayerAgent:
                 scored.append((40 + search_ev * 10, search_move))
 
         scored.sort(key=lambda x: -x[0])
-        moves = [m for _, m in scored][:10]
+        moves = [m for _, m in scored][:14]
 
         best_move = moves[0]
         best_val = float('-inf')
@@ -844,7 +853,9 @@ class PlayerAgent:
         scored = [(self._move_score(board, m, chains, my_loc, enemy_loc), m)
                   for m in raw_moves]
         scored.sort(key=lambda x: -x[0])
-        moves = [m for _, m in scored][:8]
+        # Progressive widening: more moves at shallow depths, fewer deep.
+        width = 12 if depth >= 3 else 6
+        moves = [m for _, m in scored][:width]
 
         best = float('-inf')
         for move in moves:
@@ -1010,7 +1021,15 @@ class PlayerAgent:
         # Potential is heavily discounted — banked points are 7× more valuable
         # than speculative chains. This makes the search prefer rolling over
         # extending, because rolling converts potential → banked points.
-        return (my_pts - opp_pts) + 0.15 * (my_pot - opp_pot) + 0.1 * (my_area - opp_area)
+        #
+        # Opponent chain threat: _opponent_chain_threat was previously dead code
+        # but computes the opponent's best rollable chain value. Making minimax
+        # aware of imminent opponent rolls should improve defensive decisions.
+        opp_threat = self._opponent_chain_threat(board, opp_loc, my_loc)
+        return ((my_pts - opp_pts)
+                + 0.15 * (my_pot - opp_pot)
+                + 0.1 * (my_area - opp_area)
+                - 0.7 * opp_threat)
 
     def _prime_ownership(self, board, my_loc, opp_loc) -> float:
         """For each primed cell on the board, whoever is closer is the
