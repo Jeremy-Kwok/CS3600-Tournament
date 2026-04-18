@@ -178,13 +178,152 @@ Worst case per extra search is −2 pts. If the bot makes 2 extra bad
 searches per game, the regression is −4 pts/game — smaller than v3's
 was, and easier to detect in the first batch of scrims.
 
-**Outcome:** TBD — pending 50-game scrim results.
+**Outcome (50 games vs Carrie):**
+- Mean diff: **−2.18** (improved from −2.86, +0.68 swing)
+- Win rate: **46%** (up from 32%)
+- Hit rate: **66.1%** (up from 58.6%)
+- MyBot avg: 39.6 (up from 37.2)
 
-**Lesson (if positive):** First-principles math on game rules beats
-tuning heuristics by intuition. We should have tested this before v3.
+**Lesson:** First-principles math on game rules beats tuning
+heuristics by intuition. Should have tried this before v3.
 
-**Lesson (if negative):** Even low-risk changes need to be tested on
-bytefight, not locally. Plan the revert path up front.
+---
+
+## v5 — `48508ea` — "boost steal scoring + d-2 approach (REGRESSED, reverted)"
+
+**Hypothesis:** 50 v4 games showed 45 dist-1 missed steals per game and
+22 cases where MyBot plain-moved in the wrong direction. Boost the
+steal score in `_move_score` PLAIN branch from 80 → 190 for length-2
+and 150+CARPET_PTS×3 → 220+CARPET_PTS×5 for length-3+. Add d-2
+approach bonus (80-130).
+
+**Evidence:** Steal rate 9.5%; 45 missed dist-1 steals; +80 cells over
+50 games estimate = +1.5 pts/game conservative.
+
+**Outcome (49 games):**
+- Mean diff: −2.71 (not significantly different from v4's −2.18, p=0.84)
+- Hit rate: **55.3% (significantly worse, p=0.005)**
+- Win rate: 35%
+
+**What went wrong:** Steal score 190 for length-2 beats the search
+score 44 for p=0.40 in minimax move ordering. Bot chased steal
+opportunities instead of searching. Steals are speculative (Carrie
+may roll before we arrive), while a 55% search is guaranteed +EV.
+
+**Lesson:** A new term in `_move_score` must not silently outrank
+existing gating scores. Test move-ordering consequences explicitly
+before shipping.
+
+---
+
+## v5-revert — `35d820e` — "revert v5 to v4"
+
+Same pattern as v2-revert. Clean revert, commit the zip.
+
+---
+
+## v6 — `23971a2` — "time management + endgame search + eval threat awareness"
+
+**Hypothesis:** v4 used only 59% of its 240s budget (99s wasted),
+explored 2.3M nodes (~depth 10-11 effective with alpha-beta), and
+left the `_opponent_chain_threat` function as dead code.
+
+**Change (three independent improvements bundled):**
+1. **Time:** raised cap 4s → 10s per turn, root width 10 → 14,
+   internal width 8 → 12 (progressive: 12 at depth≥3, 6 at depth≤2).
+   Safety floor at remaining < 15s.
+2. **Endgame search:** threshold drops from 0.40 → 0.33 in last 5
+   turns (pure EV breakeven).
+3. **Eval threat awareness:** activated `_opponent_chain_threat` at
+   −0.7 weight. Minimax now sees imminent opponent rolls.
+
+**Evidence:** Budget analysis showed fair-share per turn = 6.4s mid,
+16s late — all capped at 4s. 17/50 v4 games ended on PLAIN on turn
+40 (should've been search). Opponent's rollable chain threat was
+invisible to the eval.
+
+**Outcome (50 games):**
+- Mean diff: −1.58 (best so far, from −2.18)
+- Win rate: 42%
+- Nodes: 3.1M (from 2.3M, +35%)
+- Time usage: 84% (from 59%)
+- No timeouts, no failures
+
+**Lesson:** Parameter changes (time limits, widths) are much safer
+than logic changes. Activating dead code (`_opponent_chain_threat`)
+was low-risk because the function was already tested in isolation.
+
+---
+
+## v7 — `9bcd255` — "cold-roll walk + length-1 elimination"
+
+**Hypothesis:** Carrie rolls 7.5/game vs our 4.6 because she walks
+to existing primed cells (cold-rolling) instead of always building
+new chains. Fix the greedy tree to walk toward rollable chains.
+Also fix length-1 rolls (35/50 games = −0.7 pt/game leak) by
+preferring EV-breakeven search over length-1 in fallback.
+
+**Change:**
+1. Greedy branch 2 (new): if no immediate roll, scan neighbors for
+   cells adjacent to rollable chains (length≥2). If found, walk
+   there. Zero exposure risk — cashing in what's already built.
+2. Fallback path: when only length-1 carpets available, try a
+   search at 0.33 threshold first.
+
+**Outcome (50 games as Player A):**
+- Mean diff: **+0.06** (FIRST time positive!)
+- Win rate: 48%
+- MyBot avg: 40.6 (highest ever)
+- Batch consistency: 5-5, 4-6, 6-4, 5-5, 4-6 (no catastrophic batch)
+
+**Outcome (50 games as Player B — next submission):**
+- Mean diff: −3.50 (worse as B)
+- Win rate: 40%
+- Carrie plays more aggressively as A (first-mover), steals more
+  of our chains, delays our first roll by 5 turns.
+
+**Lesson:** Cold-rolling works — +2.5 pts/game vs v6. But the bot
+plays 3.5 pts/game worse as B than as A, which investigation showed
+is mostly Carrie's first-mover advantage amplifying through our
+carpet strategy. The fix for this came in v8.
+
+---
+
+## v8 — `322dfeb` — "fix 4 bugs found in deep audit"
+
+**Hypothesis:** TA advice ("simple and bug-free beats fancy and
+buggy") prompted a relentless 4-subagent audit. They found 4 real
+bugs — good ideas undermined by implementation errors.
+
+**Bugs fixed:**
+1. **Eval asymmetry (line 1048):** `_evaluate_for_current` had
+   `−0.7 × opp_threat` but no matching `+0.7 × my_threat`. Same
+   chain evaluated 2.1 pts differently from A-view vs B-view.
+   Classic sign-pessimism. Fix: `+0.7 × (my_threat − opp_threat)`.
+2. **Minimax endgame override missing (line 793):** `_should_search`
+   drops to 0.33 in last 5 turns; minimax used 0.40. Minimax was
+   rejecting +EV searches in turns 36-40.
+3. **Minimax consecutive override missing (line 782):** Greedy
+   allows back-to-back searches at prob≥0.80; minimax blocked them
+   unconditionally even at p=0.99.
+4. **`_best_steal_from` opponent block (line 1017):** Function
+   walked primed chains blocking only on our own worker. Engine
+   rejects carpet rolls through EITHER worker, so we were counting
+   phantom chain length when opp sat on the chain.
+
+**Evidence:**
+- Eval sum-to-zero test: previously off by ~±2.1 per threat; now 0.000
+- Exhaustive 8,960-state test: 0 discrepancies between `_should_search`
+  and the minimax injection after the fix
+- Engine-matching tests on `_best_steal_from`: all pass
+
+**Outcome (local, 10 games vs CarrieBot):** 10/10 wins at +40.7 avg.
+Bytefight outcome TBD.
+
+**Lesson:** Sometimes a good idea is implemented wrong. Heuristic
+tuning gets you only so far — running a rigorous audit on the
+existing code surfaces real bugs that no amount of parameter tuning
+would fix. All 4 fixes were bounded corrections, not new features.
 
 ---
 
