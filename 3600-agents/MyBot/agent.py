@@ -1058,17 +1058,18 @@ class PlayerAgent:
         # than speculative chains. This makes the search prefer rolling over
         # extending, because rolling converts potential → banked points.
         #
-        # Chain threats (SYMMETRIC). Previously the eval subtracted opp_threat
-        # but had no matching my_threat term. That made positions appear 2.1 pts
-        # worse for the current player whenever a rollable chain was on the
-        # board — a classic sign-pessimism bug that hurt both A and B play.
-        # Now both sides of the threat are accounted for symmetrically.
+        # Opponent chain threat: asymmetric on purpose. OUR chains contribute
+        # via _future_potential_points at 0.15 weight (upside — we may or may
+        # not roll them). OPP chains contribute at -0.7 weight (imminent
+        # downside — opp will roll them if close). Making this symmetric by
+        # adding +0.7 * my_threat was v8's mistake — it rewarded holding
+        # chains, re-introducing the v3 extension regression through a
+        # different mechanism. -4.7 pts/game regression confirmed.
         opp_threat = self._opponent_chain_threat(board, opp_loc, my_loc)
-        my_threat = self._opponent_chain_threat(board, my_loc, opp_loc)
         return ((my_pts - opp_pts)
                 + 0.15 * (my_pot - opp_pot)
                 + 0.1 * (my_area - opp_area)
-                + 0.7 * (my_threat - opp_threat))
+                - 0.7 * opp_threat)
 
     def _prime_ownership(self, board, my_loc, opp_loc) -> float:
         """For each primed cell on the board, whoever is closer is the
