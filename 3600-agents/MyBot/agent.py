@@ -769,21 +769,32 @@ class PlayerAgent:
                   for m in raw_moves]
 
         # ── inject search move if discipline checks pass ──
+        # Mirror the full logic of _should_search so minimax and greedy agree.
+        # Previously minimax missed: (1) endgame 0.33 override in last 5 turns,
+        # (2) consecutive-search override at 0.80+ probability.
         search_ev = 0.0
+        turns_left_local = board.player_worker.turns_left
         can_search = (self.tracker is not None
-                      and not self._searched_last_turn
                       and not self._search_hard_cap_reached())
         if can_search:
             s_loc, s_prob = self.tracker.best_guess()
+            # Consecutive-search block with HIGH-PROB override (matches greedy).
+            if self._searched_last_turn and s_prob < SEARCH_CONSECUTIVE_OVERRIDE:
+                can_search = False
+        if can_search:
             # RING-AMBIGUITY GATE: don't inject search if belief is split
             # across multiple cells on the same Manhattan ring from worker.
             peers = self.tracker.ring_peers(my_loc, s_loc, 0.4)
             ring_ok = peers < 2
             # Also require a vantage change if stuck
             vantage_ok = (self._stationary_turns < 3 or s_prob >= 0.75)
-            # Diminishing returns: tighten threshold after budget exhausted.
-            floor = SEARCH_HIGH_FLOOR if self.search_count >= SEARCH_BUDGET \
-                    else SEARCH_MINIMAX_FLOOR
+            # Endgame override: last 5 turns, use pure EV breakeven (0.33).
+            # Opportunity cost of searching approaches zero in endgame.
+            if turns_left_local <= 5:
+                floor = 0.33
+            else:
+                floor = SEARCH_HIGH_FLOOR if self.search_count >= SEARCH_BUDGET \
+                        else SEARCH_MINIMAX_FLOOR
             if s_prob >= floor and ring_ok and vantage_ok:
                 search_ev = 6.0 * s_prob - 2.0
                 search_move = Move.search(s_loc)
@@ -993,7 +1004,9 @@ class PlayerAgent:
         """Best carpet roll length available from loc (counting any primed cells).
 
         Used to detect steal opportunities — walking to loc and rolling
-        opponent's primed chain next turn.
+        the chain next turn. Blocks on BOTH workers: the roll is invalid
+        if any chain cell is occupied by a worker (carpet ends on the k-th
+        cell, which can't be on either worker).
         """
         primed = board._primed_mask
         if not primed:
@@ -1001,6 +1014,9 @@ class PlayerAgent:
         lx, ly = loc
         start_bit = 1 << (ly * BOARD_SIZE + lx)
         my_bit = 1 << (my_loc[1] * BOARD_SIZE + my_loc[0])
+        opp_loc = board.opponent_worker.get_location()
+        opp_bit = 1 << (opp_loc[1] * BOARD_SIZE + opp_loc[0])
+        blockers = my_bit | opp_bit
         best = 0
         for d in ALL_DIRS:
             shift = SHIFTS[int(d)]
@@ -1008,7 +1024,7 @@ class PlayerAgent:
             cur = start_bit
             for _ in range(BOARD_SIZE - 1):
                 cur = shift(cur)
-                if not cur or (cur & my_bit) or not (cur & primed):
+                if not cur or (cur & blockers) or not (cur & primed):
                     break
                 length += 1
             if length > best:
@@ -1042,14 +1058,17 @@ class PlayerAgent:
         # than speculative chains. This makes the search prefer rolling over
         # extending, because rolling converts potential → banked points.
         #
-        # Opponent chain threat: _opponent_chain_threat was previously dead code
-        # but computes the opponent's best rollable chain value. Making minimax
-        # aware of imminent opponent rolls should improve defensive decisions.
+        # Chain threats (SYMMETRIC). Previously the eval subtracted opp_threat
+        # but had no matching my_threat term. That made positions appear 2.1 pts
+        # worse for the current player whenever a rollable chain was on the
+        # board — a classic sign-pessimism bug that hurt both A and B play.
+        # Now both sides of the threat are accounted for symmetrically.
         opp_threat = self._opponent_chain_threat(board, opp_loc, my_loc)
+        my_threat = self._opponent_chain_threat(board, my_loc, opp_loc)
         return ((my_pts - opp_pts)
                 + 0.15 * (my_pot - opp_pot)
                 + 0.1 * (my_area - opp_area)
-                - 0.7 * opp_threat)
+                + 0.7 * (my_threat - opp_threat))
 
     def _prime_ownership(self, board, my_loc, opp_loc) -> float:
         """For each primed cell on the board, whoever is closer is the
