@@ -258,6 +258,13 @@ class PlayerAgent:
         self.max_depth_reached = 0
         self.total_nodes = 0
 
+        # ── killer move heuristic ──
+        # Classic chess-bot speedup: moves that cause beta-cutoffs tend to
+        # also cut in sibling subtrees at the same depth. Trying them first
+        # increases alpha-beta pruning without changing search decisions.
+        # Reset per play() call; accumulates across iterative-deepening passes.
+        self.killer_moves = [[] for _ in range(60)]
+
     @staticmethod
     def _to_numpy_2d(T) -> np.ndarray:
         """Robustly convert a transition matrix to a contiguous numpy float64 array.
@@ -733,8 +740,20 @@ class PlayerAgent:
 
     # ─────────────────────── minimax ───────────────────────
 
+    @staticmethod
+    def _move_key(m):
+        """Hashable key for Move objects (no __eq__ on Move class)."""
+        return (int(m.move_type),
+                int(m.direction) if m.direction is not None else -1,
+                m.roll_length,
+                m.search_loc if m.search_loc is not None else (-1, -1))
+
     def _minimax_search(self, board: Board, time_left: Callable):
         """Iterative-deepening negamax with search move injected at root."""
+        # Reset killer table at start of each turn's iterative deepening.
+        # Killers accumulate across depth iterations within this call.
+        for i in range(len(self.killer_moves)):
+            self.killer_moves[i] = []
         remaining = time_left()
         try:
             print(f"[MM] turn={self.turn_number} remaining={remaining:.3f}",
@@ -888,6 +907,16 @@ class PlayerAgent:
         width = 12 if depth >= 3 else 6
         moves = [m for _, m in scored][:width]
 
+        # KILLER MOVE HEURISTIC: moves that caused beta-cutoffs in sibling
+        # subtrees at this depth are likely to cut here too. Try them first
+        # to maximize alpha-beta pruning. Purely a reordering — doesn't
+        # change decisions, just explores faster.
+        if 0 <= depth < len(self.killer_moves) and self.killer_moves[depth]:
+            killer_keys = set(self.killer_moves[depth])
+            killers = [m for m in moves if self._move_key(m) in killer_keys]
+            others = [m for m in moves if self._move_key(m) not in killer_keys]
+            moves = killers + others
+
         best = float('-inf')
         for move in moves:
             new_board = board.forecast_move(move, check_ok=False)
@@ -901,6 +930,14 @@ class PlayerAgent:
             if val > alpha:
                 alpha = val
             if alpha >= beta:
+                # Record this move as a killer for this depth.
+                if 0 <= depth < len(self.killer_moves):
+                    k = self._move_key(move)
+                    kl = self.killer_moves[depth]
+                    if k not in kl:
+                        kl.insert(0, k)
+                        if len(kl) > 2:
+                            kl.pop()
                 break
         return best
 
